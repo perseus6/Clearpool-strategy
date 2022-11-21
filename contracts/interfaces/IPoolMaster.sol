@@ -35,5 +35,9 @@ interface IPoolMaster is IERC20Metadata {
     function getUtilizationRate() external view returns (uint256);
 
     function withdrawableRewardOf(address account) external view returns (uint256);
+
     function withdrawReward(address account) external returns (uint256);
+    function redeem(uint256 tokens) external;
+    function redeemCurrency(uint256 currencyAmount) external;
+    function provide(uint256 currencyAmount) external;
 }

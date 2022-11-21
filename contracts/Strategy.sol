@@ -21,25 +21,29 @@ contract CPStrategy is BaseStrategy {
 
   address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
+  uint256 private constant DEPOSIT_THRESHOLD = 10;
+
   IPoolFactory public poolFactory;
 
   address public cpool;
 
-  address[] public masters;
+  IPoolMaster[] public masters;
 
   address public router;
 
   constructor(
     address _vault,
-    address _factory
+    address _factory,
+    address _router
   ) BaseStrategy(_vault) {
     require(_factory != address(0), "CBZ");
 
     poolFactory = IPoolFactory(_factory);
-
-    require(poolFactory.currencyAllowed(address(want)), "CNS"); // Currency want is Not Supported.
+    // Check if Currency want is supported.
+    require(poolFactory.currencyAllowed(address(want)), "CNS");
 
     cpool = poolFactory.cpool();
+    router = _router;
   }
 
   function name() external view override returns (string memory) {
@@ -47,10 +51,12 @@ contract CPStrategy is BaseStrategy {
   }
 
   function estimatedTotalAssets() public view override returns (uint256) {
-    uint256 total = 0;
+    uint256 total = _balance(want);
+    uint256 length = masters.length;
+    IPoolMaster[] memory _masters = masters;
 
-    for (uint256 i = 0; i < masters.length; i++) {
-      IPoolMaster master = IPoolMaster(masters[i]);
+    for (uint256 i; i < length; i++) {
+      IPoolMaster master = _masters[i];
       uint256 rate = master.getCurrentExchangeRate();
       uint256 bal = master.balanceOf(address(this));
       uint256 wantAmount = bal.mulDecimal(rate);
@@ -112,25 +118,29 @@ contract CPStrategy is BaseStrategy {
     // NOTE: Maintain invariant `want.balanceOf(this) >= _liquidatedAmount`
     // NOTE: Maintain invariant `_liquidatedAmount + _loss <= _amountNeeded`
 
-    uint256 totalAssets = want.balanceOf(address(this));
-    if (_amountNeeded > totalAssets) {
-      _liquidatedAmount = totalAssets;
-      _loss = _amountNeeded.sub(totalAssets);
-    } else {
-      _liquidatedAmount = _amountNeeded;
+    uint256 wantBal = _balance(want);
+
+    if (_amountNeeded > wantBal) {
+      uint256 toWithdraw = _amountNeeded - wantBal; // no underflow
+      uint256 withdrawn = _redeem(toWithdraw);
+      if (withdrawn < toWithdraw) {
+        _loss = toWithdraw - withdrawn; // no underflow
+      }
     }
+
+    _liquidatedAmount = _amountNeeded.sub(_loss);
   }
 
-  function liquidateAllPositions() internal override returns (uint256) {
-    // TODO: Liquidate all positions and return the amount freed.
-    return want.balanceOf(address(this));
+  function liquidateAllPositions() internal override returns (uint256 amountFreed) {
+    _redeem(uint256(int(-1)));
+    amountFreed = _balance(want);
   }
 
   // NOTE: Can override `tendTrigger` and `harvestTrigger` if necessary
 
   function prepareMigration(address _newStrategy) internal override {
     for (uint256 i = 0; i < masters.length; i++) {
-      IPoolMaster master = IPoolMaster(masters[i]);
+      IPoolMaster master = masters[i];
       uint256 bal = master.balanceOf(address(this));
       if (bal != 0)
         master.safeTransfer(_newStrategy, bal);
@@ -155,7 +165,20 @@ contract CPStrategy is BaseStrategy {
     view
     override
     returns (address[] memory)
-  {}
+  {
+    IPoolMaster[] memory _masters = masters;
+    uint256 i;
+    uint256 length = _masters.length;
+    address[] memory protected = new address[](2 + length);
+
+    for (; i < length; i++) {
+        protected[i] = address(_masters[i]);
+    }
+    protected[i] = address(this);
+    protected[1 + i] = cpool;
+
+    return protected;
+  }
 
   /**
    * @notice
@@ -188,6 +211,123 @@ contract CPStrategy is BaseStrategy {
     address[] memory path = _getPath(WETH, _wantAddress);
     uint256[] memory amounts = IUniswapV2Router(router).getAmountsOut(_amtInWei, path);
     return amounts[amounts.length - 1];
+  }
+
+  function provide(IPoolMaster[] memory _pools, uint256[] memory _amounts) external onlyVaultManagers {
+    uint256 length = _pools.length;
+    require(0 != length && length == _amounts.length, "LNM");
+
+    for (uint256 i; i < length; i++)
+      _provide(_pools[i], _amounts[i]);
+  }
+
+  function redeem(IPoolMaster[] memory _pools, uint256[] memory _amounts) external onlyVaultManagers {
+    uint256 length = _pools.length;
+    require(0 != length && length == _amounts.length, "LNM");
+
+    for (uint256 i; i < length; i++)
+      _redeem(_pools[i], _amounts[i]);
+  }
+
+  function _addPool(IPoolMaster _pool)
+    internal
+    returns (bool)
+  {
+    uint256 length = masters.length;
+    IPoolMaster[] memory _masters = masters;
+
+    for (uint256 i; i < length; i++) {
+      if (_pool == _masters[i]) return false;
+    }
+
+    masters.push(_pool);
+    return true;
+  }
+
+  function _removePool(IPoolMaster _pool)
+    internal
+    returns (bool)
+  {
+    uint256 length = masters.length;
+    IPoolMaster[] memory _masters = masters;
+
+    for (uint256 i; i < length; i++) {
+      if (_pool == _masters[i]) {
+        masters[i] = _masters[length - 1];
+        masters.pop();
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function _provide(IPoolMaster _pool, uint256 _wantAmount) internal {
+    require(
+      poolFactory.isPool(address(_pool)),
+      "NAP"
+    );
+    IPoolMaster.State state = _pool.state();
+    require(
+      state == IPoolMaster.State.Active ||
+      state == IPoolMaster.State.Warning ||
+      state == IPoolMaster.State.ProvisionalDefault,
+      "PIA"
+    );
+    uint256 wantBal = _balance(want);
+
+    if (_wantAmount > wantBal) _wantAmount = wantBal;
+
+    if (_wantAmount <= DEPOSIT_THRESHOLD) return;
+
+    _pool.provide(_wantAmount);
+    _addPool(_pool);
+  }
+
+  function _redeem(uint256 _tokensToWithdraw) internal returns (uint256 wantRedeemed) {
+    uint256 length = masters.length;
+    IPoolMaster[] memory _masters = masters;
+
+    for (uint256 i; i < length; i++) {
+      uint256 tokensWithdrawed = _redeem(_masters[i], _tokensToWithdraw);
+      wantRedeemed = wantRedeemed.add(tokensWithdrawed);
+
+      if (tokensWithdrawed >= _tokensToWithdraw)
+        break;
+        
+      _tokensToWithdraw = _tokensToWithdraw - tokensWithdrawed; // no underflow
+    }
+  }
+
+  function _redeem(IPoolMaster _pool, uint256 _tokensToWithdraw)
+    internal
+    returns (uint256 wantRedeemed)
+  {
+    require(
+      poolFactory.isPool(address(_pool)),
+      "NAP"
+    );
+    uint256 wantAvailable = _availabeFromPool(_pool);
+
+    if (_tokensToWithdraw >= wantAvailable) {
+      _removePool(_pool);
+      _tokensToWithdraw = wantAvailable;
+    }
+
+    _pool.redeemCurrency(_tokensToWithdraw);
+    return _tokensToWithdraw;
+  }
+
+  function _availabeFromPool(IPoolMaster _pool)
+    internal
+    returns (uint256 wantAvailable)
+  {
+    uint256 rate = _pool.getCurrentExchangeRate();
+    uint256 bal = _pool.balanceOf(address(this));
+    uint256 wantAmount = bal.mulDecimal(rate);
+    uint256 poolAmount = _pool.availableToWithdraw();
+
+    wantAvailable = wantAmount > poolAmount ? poolAmount : wantAmount;
   }
 
   function _getPath(address assetIn, address assetOut)
